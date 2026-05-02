@@ -1,0 +1,47 @@
+Cache fs.existsSync calls in plugin scan path
+TL;DR
+Plugin manifest discovery and bundled directory scanning call fs.existsSync 41 times across hot paths during cold start. These are synchronous calls in the main event loop. CPU profiling on Windows shows fs.existsSync self-time of 25.4 seconds during a single cold start.
+This PR adds a process-level memoization cache for those calls. After the patch, existsSync self-time drops to 1.3 seconds — a 95% reduction.
+Motivation
+While debugging slow cold starts (openclaw agent --local taking 48+ seconds before any agent work begins), I captured a CPU profile via node --cpu-prof. The Sandwich view in speedscope showed fs.existsSync as the single largest self-time contributor.
+Before:
+FunctionSelf timeTotal time% of profileexistsSync25,429 ms26,249 ms~50%ensureCliPluginRegistryLoaded22,833 ms69,091 ms—readFileUtf88,444 ms8,763 ms—
+The 25 seconds is not a single slow call — it's the cumulative cost of repeated existsSync invocations during plugin discovery. Three files dominate:
+
+src/plugins/bundle-manifest.ts — 18 calls (e.g. resolveCodexSkillDirs, hasCursorMcpCapability, manifest format probing)
+src/plugins/bundled-dir.ts — 14 calls (workspace root probing, override resolution)
+src/plugins/sdk-alias.ts — 9 calls (SDK alias candidate resolution)
+
+In every case, the path being checked is read-only during the plugin scan phase, and many paths are checked multiple times — for example, bundle-manifest.ts checks path.join(rootDir, "skills") twice (lines 145 and 158 in the original source) within a single plugin's manifest resolution.
+What this PR changes
+
+Introduces src/shared/cached-fs.ts exporting existsSyncCached(p) and invalidateExistsSyncCache(p?).
+Replaces 41 fs.existsSync(...) call sites with existsSyncCached(...) across the three files above.
+
+The cache is process-level. Cached values are never invalidated automatically — the assumption is that paths checked in the plugin scan phase are stable. invalidateExistsSyncCache is exposed for tests and for future callers that mutate paths and want subsequent checks to hit the disk.
+control-ui-assets.ts was intentionally not modified — it uses controlUiFsRuntime.existsSync (a different abstraction layer) rather than fs.existsSync directly. Worth a follow-up but out of scope for this PR.
+Validation
+CPU profile was captured by setting NODE_OPTIONS="--cpu-prof --cpu-prof-dir=..." and running openclaw agent --local --message "ping" --timeout 30 to a deliberate session-arg error (which is enough to exercise the full plugin discovery path).
+Profiles were inspected in speedscope (Sandwich view, sorted by total time).
+MetricBeforeAfterΔexistsSync self time25,429 ms1,283 ms−95%existsSync total time26,249 ms6,315 ms−76%existsSyncCached self timen/a4.8 ms—Profile file size7.2 MBsmaller—
+The remaining ~1.3 s of fs.existsSync self-time comes from call sites elsewhere (e.g. control-ui-assets.ts and other files with low call counts) that are not part of this PR.
+The patch was also applied to a 4.29 production install (manually patching dist/bundle-manifest-*.js) and verified by:
+
+openclaw --version returns normally (no stack overflow / no recursion bug)
+openclaw gateway --force brings the gateway up cleanly to [gateway] ready
+All plugins load (acpx, bonjour, browser, device-pair, feishu, file-transfer, memory-core, openclaw-weixin, phone-control, talk-voice)
+
+What this PR does NOT fix
+The original investigation was triggered by a 200–300 s cold-start complaint. After this PR, most of the wall-clock cold-start time remains — it's dominated by other stages visible in the embedded-run trace summary, e.g.:
+runtime-plugins:    54s
+core-plugin-tools:  97s
+system-prompt:      73s
+stream-setup:       51s
+These look architectural (likely candidates for #67000 — warm reuse / session standby) and are out of scope for this PR.
+Risk
+Low. The cache only memoizes return values of a pure read-only filesystem query, scoped to the lifetime of a single Node process. The path set being checked is stable during plugin discovery (no scan-time path creation). If a future caller needs invalidation, invalidateExistsSyncCache is available.
+Notes for reviewers
+
+All three modified files import the new existsSyncCached from ../shared/cached-fs.js (or the appropriate relative path).
+The native fs.existsSync in cached-fs.ts is the only direct call to the Node API — this is intentional and correct (the cache function itself uses fs.existsSync to populate the cache; the recursion-via-replacement bug was caught and fixed during development).
+No existing tests were modified. Adding a cached-fs.test.ts would be a reasonable follow-up.
